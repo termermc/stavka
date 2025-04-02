@@ -57,6 +57,9 @@ per-request WebAssembly instances to provide dynamic caching behavior, providing
 and optionally using WASI to provide an interface into the host system as a whole for more complex behavior. Rust will be a first-class
 citizen.
 
+WebAssembly modules should be hot-swappable, allowing for not only dynamic caching behavior, but deployment of new and updated behavior
+without any downtime.
+
 # Technical Details
 
 Here are some miscellaneous planned technical details about the project.
