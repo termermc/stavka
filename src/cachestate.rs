@@ -39,8 +39,5 @@ async fn create_and_open_block_file(hash: FileBlockHash, cache_root: &Path) -> R
         .open(file_path)
         .await?;
 
-    // Flock the file.
-
-
     Ok(file)
 }
