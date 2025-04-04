@@ -1,41 +1,67 @@
-use crate::hash::{create_file_block_hash, FileBlockInfo};
+use bytes::Bytes;
+use http::Request;
+use monoio::net::{TcpListener, TcpStream};
+use monoio_http::h2::{
+    server::{self, SendResponse},
+    RecvStream,
+};
 
 mod cachestate;
 mod hash;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // let num_threads = std::thread::available_parallelism()?.get();
-    //
-    // // Launch thread
-    // let mut threads = Vec::new();
-    //
-    // let mut thread_num = 0;
-    // for _ in 0..num_threads {
-    //     println!("Spawning thread {}", thread_num);
-    //     thread_num += 1;
-    //
-    //     threads.push(std::thread::spawn(|| {
-    //         tokio_uring::start(async {
-    //             let mut num = 0;
-    //             loop {
-    //                 if num == 0 {
-    //                     num = 1;
-    //                 } else {
-    //                     num = 0;
-    //                 }
-    //             }
-    //         });
-    //     }));
-    // }
-    //
-    // for thread in threads {
-    //     thread.join().unwrap();
-    // }
+use std::error::Error;
 
-    tokio_uring::start(async {
-        let hash = create_file_block_hash("foo.txt", FileBlockInfo { block_size: 1024, block_num: 0 });
-        
-    });
+#[monoio::main]
+async fn main() {
+    let listener = TcpListener::bind("127.0.0.1:7081").unwrap();
+    println!("listening on {:?}", listener.local_addr());
+
+    loop {
+        if let Ok((socket, _peer_addr)) = listener.accept().await {
+            println!("TCP connection accept");
+            monoio::spawn(async move {
+                if let Err(e) = serve(socket).await {
+                    println!("  -> err={:?}", e);
+                }
+            });
+        }
+    }
+}
+
+async fn serve(socket: TcpStream) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let mut connection = server::handshake(socket).await.expect("Handshake failed");
+
+    while let Some(result) = connection.accept().await {
+        let (request, respond) = result?;
+        monoio::spawn(async move {
+            if let Err(e) = handle_request(request, respond).await {
+                println!("error while handling request: {}", e);
+            }
+        });
+    }
+
+    println!("~~~~~~~~~~~ H2 connection CLOSE !!!!!! ~~~~~~~~~~~");
+    Ok(())
+}
+
+async fn handle_request(
+    mut request: Request<RecvStream>,
+    mut respond: SendResponse<Bytes>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    println!("GOT request: {:?}", request);
+
+    let body = request.body_mut();
+    while let Some(data) = body.data().await {
+        let data = data?;
+        println!("<<<< recv {:?}", data);
+        let _ = body.flow_control().release_capacity(data.len());
+    }
+
+    let response = http::Response::new(());
+    let mut send = respond.send_response(response, false)?;
+    println!(">>>> send");
+    send.send_data(Bytes::from_static(b"hello "), false)?;
+    send.send_data(Bytes::from_static(b"world\n"), true)?;
 
     Ok(())
 }

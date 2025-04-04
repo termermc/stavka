@@ -64,7 +64,7 @@ without any downtime.
 
 Here are some miscellaneous planned technical details about the project.
 
- - Linux-only with io_uring and Tokio
+ - Linux-only with [Monoio](https://github.com/bytedance/monoio)
  - Intended to sit directly in front of the Internet without a reverse proxy
  - Use as little locking as possible
  - Multithreaded
