@@ -22,7 +22,7 @@ use monoio_http::{
 };
 
 async fn thread_main() -> Result<(), io::Error> {
-    let listener = TcpListener::bind("127.0.0.1:50002").unwrap();
+    let listener = TcpListener::bind("0.0.0.0:50002").unwrap();
 
     unsafe {
         let optval: libc::c_int = 1;
@@ -65,20 +65,9 @@ fn thread_launcher(core: usize) -> std::thread::JoinHandle<()> {
     })
 }
 
-fn main() -> Result<(), io::Error> {
-    let thread_count = available_parallelism().map_or(1, NonZeroUsize::get);
-    println!("Starting with {thread_count} threads (one per logical CPU)");
-
-    let threads: Vec<_> = (0..thread_count).map(thread_launcher).collect();
-
-    // Wait for all threads to complete
-    for thread in threads {
-        thread.join().expect("failed to execute thread");
-    }
-
-    println!("All threads completed");
-
-    Ok(())
+#[monoio::main(timer_enabled = true, worker_threads = 12)]
+async fn main() {
+    thread_main().await.expect("main failed")
 }
 
 async fn handle_connection(stream: TcpStream) {
