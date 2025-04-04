@@ -520,6 +520,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "http",
+ "libc",
  "monoio",
  "monoio-http",
  "xxhash-rust",
