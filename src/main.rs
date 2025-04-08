@@ -2,9 +2,11 @@ mod cachestate;
 mod hash;
 
 use std::io;
+use std::mem::size_of_val;
 use std::num::NonZeroUsize;
 use std::os::fd::AsRawFd;
 use std::thread::available_parallelism;
+use bytes::Bytes;
 use http::{response::Builder, HeaderMap, StatusCode};
 use monoio::{io::{
     sink::{Sink, SinkExt},
@@ -117,36 +119,37 @@ async fn handle_task(
 }
 
 async fn handle_request(req: Request) -> Response {
-    let mut headers = HeaderMap::new();
-    headers.insert("Server", "monoio-http-demo".parse().unwrap());
-    let mut has_error = false;
-    let mut has_payload = false;
-    let payload = match req.into_body() {
-        Payload::None => Payload::None,
-        Payload::Fixed(mut p) => match p.next().await.unwrap() {
-            Ok(data) => {
-                has_payload = true;
-                Payload::Fixed(FixedPayload::new(data))
-            }
-            Err(_) => {
-                has_error = true;
-                Payload::None
-            }
-        },
-        Payload::Stream(_) => unimplemented!(),
-    };
-
-    let status = if has_error {
-        StatusCode::INTERNAL_SERVER_ERROR
-    } else if has_payload {
-        StatusCode::OK
-    } else {
-        StatusCode::NO_CONTENT
-    };
+    // let mut headers = HeaderMap::new();
+    // headers.insert("Server", "monoio-http-demo".parse().unwrap());
+    // let mut has_error = false;
+    // let mut has_payload = false;
+    // let payload = match req.into_body() {
+    //     Payload::None => Payload::None,
+    //     Payload::Fixed(mut p) => match p.next().await.unwrap() {
+    //         Ok(data) => {
+    //             has_payload = true;
+    //             Payload::Fixed(FixedPayload::new(data))
+    //         }
+    //         Err(_) => {
+    //             has_error = true;
+    //             Payload::None
+    //         }
+    //     },
+    //     Payload::Stream(_) => unimplemented!(),
+    // };
+    //
+    // let status = if has_error {
+    //     StatusCode::INTERNAL_SERVER_ERROR
+    // } else if has_payload {
+    //     StatusCode::OK
+    // } else {
+    //     StatusCode::NO_CONTENT
+    // };
     Builder::new()
-        .status(status)
-        .header("Server", "monoio-http-demo")
-        .body(payload)
+        .status(StatusCode::OK)
+        //.header("Server", "monoio-http-demo")
+        //.body(Payload::None)
+        .body(Payload::Fixed(FixedPayload::new(Bytes::from_static(b"Hello, World!"))))
         .unwrap()
 }
 
