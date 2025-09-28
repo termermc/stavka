@@ -5,7 +5,8 @@ edition = "2021"
 
 [dependencies]
 monoio = { version = "0.2.4", features = ["default", "mkdirat"] }
-monoio-http = { version = "0.3.12", features = ["default"] }
+monoio-http = { git = "https://github.com/monoio-rs/monoio-http.git", rev = "c8f8187dbd434c6a923a7f6b07664d600025735a" }
+monoio-http-client = { git = "https://github.com/monoio-rs/monoio-http.git", rev = "c8f8187dbd434c6a923a7f6b07664d600025735a" }
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 bytes = "1.10.1"
 http = "1.3.1"

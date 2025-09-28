@@ -1,13 +1,16 @@
 mod cachestate;
 mod hash;
+mod origin;
 
+use std::cell::RefCell;
 use std::io;
+use std::io::ErrorKind::NotFound;
 use std::mem::size_of_val;
 use std::num::NonZeroUsize;
 use std::os::fd::AsRawFd;
-use std::thread::available_parallelism;
+use std::rc::Rc;
 use bytes::Bytes;
-use http::{response::Builder, HeaderMap, StatusCode};
+use http::{response::Builder, StatusCode};
 use monoio::{io::{
     sink::{Sink, SinkExt},
     stream::Stream,
@@ -22,9 +25,17 @@ use monoio_http::{
     },
     util::spsc::{spsc_pair, SPSCReceiver},
 };
+use monoio_http::common::body::{Body, HttpBody};
+use monoio_http_client::Client;
 
 async fn thread_main() -> Result<(), io::Error> {
-    let listener = TcpListener::bind("0.0.0.0:50002").unwrap();
+    let http_client = Rc::new(Client::default());
+    let mut origin_manager = Rc::new(RefCell::new(origin::OriginManager::new()));
+
+    origin_manager.borrow_mut().set_origin_host("stavka.localhost".to_owned(), "1.1.1.1".to_owned());
+
+    let bind_addr = "0.0.0.0:50002";
+    let listener = TcpListener::bind(bind_addr).expect(&*("failed to listen on port addr ".to_owned() + bind_addr));
 
     unsafe {
         let optval: libc::c_int = 1;
@@ -46,7 +57,11 @@ async fn thread_main() -> Result<(), io::Error> {
         match incoming {
             Ok((stream, addr)) => {
                 //println!("accepted a connection from {}", addr);
-                monoio::spawn(handle_connection(stream));
+                monoio::spawn(handle_connection(
+                    stream,
+                    http_client.clone(),
+                    origin_manager.clone(),
+                ));
             }
             Err(e) => {
                 println!("accepted connection failed: {}", e);
@@ -72,12 +87,21 @@ async fn main() {
     thread_main().await.expect("main failed")
 }
 
-async fn handle_connection(stream: TcpStream) {
+async fn handle_connection(
+    stream: TcpStream,
+    http_client: Rc<Client>,
+    origin_manager: Rc<RefCell<origin::OriginManager>>,
+) {
     let (r, w) = stream.into_split();
     let sender = GenericEncoder::new(w);
     let mut receiver = RequestDecoder::new(r);
     let (mut tx, rx) = spsc_pair();
-    monoio::spawn(handle_task(rx, sender));
+    monoio::spawn(handle_task(
+        rx,
+        sender,
+        http_client,
+        origin_manager,
+    ));
 
     loop {
         match receiver.next().await {
@@ -104,8 +128,10 @@ async fn handle_connection(stream: TcpStream) {
 
 async fn handle_task(
     mut receiver: SPSCReceiver<Request>,
-    mut sender: impl Sink<Response, Error = impl Into<HttpError>>,
-) -> Result<(), HttpError> {
+    mut sender: impl Sink<Response<HttpBody>, Error = impl Into<HttpError>>,
+    http_client: Rc<Client>,
+    origin_manager: Rc<RefCell<origin::OriginManager>>,
+) -> Result<(), Box<dyn std::error::Error>> {
     loop {
         let request = match receiver.recv().await {
             Some(r) => r,
@@ -113,14 +139,83 @@ async fn handle_task(
                 return Ok(());
             }
         };
-        let resp = handle_request(request).await;
-        sender.send_and_flush(resp).await.map_err(Into::into)?;
+        let resp = handle_request(
+            request,
+            http_client.clone(),
+            origin_manager.clone(),
+        ).await?;
+        sender.send_and_flush(resp).await.map_err(|e| e.into())?;
     }
 }
 
-async fn handle_request(req: Request) -> Response {
-    // let mut headers = HeaderMap::new();
-    // headers.insert("Server", "monoio-http-demo".parse().unwrap());
+async fn handle_request(
+    req: Request,
+    http_client: Rc<Client>,
+    origin_manager: Rc<RefCell<origin::OriginManager>>,
+) -> Result<Response<HttpBody>, Box<dyn std::error::Error>> {
+    let uri = req.uri();
+
+    fn not_found() -> Response<HttpBody> {
+        Builder::new().
+            status(StatusCode::NOT_FOUND).
+            body(
+                HttpBody::from(
+                    Payload::Fixed(FixedPayload::new(Bytes::from_static(b"hello world"))),
+                ),
+            ).unwrap()
+    }
+
+    let host = req.headers().get(http::header::HOST);
+    if host == None {
+        return Ok(not_found())
+    }
+    let host = host.unwrap().to_str();
+    if host.is_err() {
+        return Ok(not_found())
+    }
+    let mut host = host.unwrap();
+    let colon_idx = host.rfind(':');
+    match colon_idx {
+        Some(idx) => {
+            host = &host[..idx];
+        }
+        None => {}
+    }
+
+    let origin_manager = origin_manager.borrow();
+    let origin = origin_manager.uri_to_origin_uri(uri.clone(), host);
+    if origin.is_none() {
+        return Ok(not_found())
+    }
+    let origin = origin.unwrap();
+
+    // Make origin HTTP request.
+    let mut origin_req = Request::builder().
+        method(req.method()).
+        uri(origin);
+
+    for (k, v) in req.headers() {
+        if k == http::header::HOST {
+            continue
+        }
+
+        origin_req = origin_req.header(k, v);
+    }
+
+    let body = req.into_body();
+    let origin_req = origin_req.body(body)?;
+    let origin_res = http_client.send_request(origin_req).await?;
+
+    let mut res = Builder::new().
+        status(origin_res.status());
+    for (k, v) in origin_res.headers() {
+        res = res.header(k, v);
+    }
+
+    let body = origin_res.into_body();
+
+    Ok(res.body(body).unwrap())
+
     // let mut has_error = false;
     // let mut has_payload = false;
     // let payload = match req.into_body() {
@@ -145,11 +240,10 @@ async fn handle_request(req: Request) -> Response {
     // } else {
     //     StatusCode::NO_CONTENT
     // };
-    Builder::new()
-        .status(StatusCode::OK)
-        //.header("Server", "monoio-http-demo")
-        //.body(Payload::None)
-        .body(Payload::Fixed(FixedPayload::new(Bytes::from_static(b"Hello, World!"))))
-        .unwrap()
+    // Ok(Builder::new()
+    //     .status(status)
+    //     .header("Server", "monoio-http-demo")
+    //     .body(payload)
+    //     //.body(Payload::Fixed(FixedPayload::new(Bytes::from_static(b"Hello, World!"))))
+    //     .unwrap())
 }
-
