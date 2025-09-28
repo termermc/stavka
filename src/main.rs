@@ -4,13 +4,12 @@ mod origin;
 
 use std::cell::RefCell;
 use std::io;
-use std::io::ErrorKind::NotFound;
 use std::mem::size_of_val;
-use std::num::NonZeroUsize;
 use std::os::fd::AsRawFd;
 use std::rc::Rc;
 use bytes::Bytes;
 use http::{response::Builder, StatusCode};
+use http::uri::Scheme;
 use monoio::{io::{
     sink::{Sink, SinkExt},
     stream::Stream,
@@ -32,7 +31,11 @@ async fn thread_main() -> Result<(), io::Error> {
     let http_client = Rc::new(Client::default());
     let mut origin_manager = Rc::new(RefCell::new(origin::OriginManager::new()));
 
-    origin_manager.borrow_mut().set_origin_host("stavka.localhost".to_owned(), "1.1.1.1".to_owned());
+    origin_manager.borrow_mut().set_origin_host(
+        "stavka.localhost".to_owned(),
+        Scheme::HTTPS,
+        "1.1.1.1".to_owned().try_into().expect("should have been valid authority"),
+    );
 
     let bind_addr = "0.0.0.0:50002";
     let listener = TcpListener::bind(bind_addr).expect(&*("failed to listen on port addr ".to_owned() + bind_addr));
@@ -195,10 +198,6 @@ async fn handle_request(
         uri(origin);
 
     for (k, v) in req.headers() {
-        if k == http::header::HOST {
-            continue
-        }
-
         origin_req = origin_req.header(k, v);
     }
 
