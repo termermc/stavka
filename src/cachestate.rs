@@ -1,9 +1,10 @@
+use crate::cachestate::ObjectMetaVersion::V0;
+use crate::constant::MAX_COVERAGE_BLOCK_SKIP_SIZE;
+use crate::hash::FileBlockHash;
+use monoio::buf::IoBufMut;
+use std::cmp::max;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
 use std::path::Path;
-use monoio::buf::IoBufMut;
-use monoio_http_client::Error;
-use crate::cachestate::ObjectMetaVersion::V0;
-use crate::hash::FileBlockHash;
 
 #[repr(u8)]
 enum ObjectMetaVersion {
@@ -27,16 +28,38 @@ pub struct ObjectMetaPreamble {
     pub size_bytes: u64,
     pub block_size: u32,
     pub headers: Vec<(String, String)>,
+    // TODO Store ETag as its own Option field?
+    // We have to invalidate the cache if the ETag changes.
+    // We also need to invalidate the cache if the origin reports a different size, even if the ETag is the same.
+    // pub etag: Option<String>,
+}
+
+/// A loaded cache block coverage map.
+struct LoadedCoverageMap(pub Vec<bool>);
+
+impl LoadedCoverageMap {
+    /// Returns whether the block at the following index is covered.
+    #[inline]
+    pub fn is_covered(&self, block_num: u64) -> bool {
+        self.0[block_num as usize]
+    }
+
+    /// Marks the block at the following index as covered.
+    /// Only does so in memory; does not write to the underlying coverage map on disk.
+    #[inline]
+    fn mark_covered(&mut self, block_num: u64) {
+        self.0[block_num as usize] = true;
+    }
 }
 
 pub struct ObjectMeta {
     pub preamble: ObjectMetaPreamble,
     pub coverage_map_offset: u64,
-    pub coverage_map: Vec<bool>
+    pub coverage_map: LoadedCoverageMap,
 }
 
 impl ObjectMeta {
-    pub fn from_bytes(buf: &[u8]) -> Result<Self, Box<dyn std::error::Error> > {
+    pub fn from_bytes(buf: &[u8]) -> Result<Self, Box<dyn std::error::Error>> {
         let (preamble, _, offset) = Self::deserialize_preamble(buf)?;
 
         let coverage_map = &buf[offset..];
@@ -44,11 +67,11 @@ impl ObjectMeta {
         Ok(ObjectMeta {
             preamble,
             coverage_map_offset: offset as u64,
-            coverage_map: coverage_map.iter().map(|&b| b == 1).collect(),
+            coverage_map: LoadedCoverageMap(coverage_map.iter().map(|&b| b == 1).collect()),
         })
     }
 
-    pub async fn from_file(path: &Path) -> Result<Self, Box<dyn std::error::Error> > {
+    pub async fn from_file(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
         let file = monoio::fs::read(path).await?;
         Self::from_bytes(&file).map_err(|e| e.into())
     }
@@ -60,36 +83,29 @@ impl ObjectMeta {
         if buf.len() < (offset + 8) as usize {
             return Err("buffer too small for exp_ts".into());
         }
-        let exp_ts = u64::from_le_bytes(
-            buf[offset..offset + 8].try_into().unwrap(),
-        );
+        let exp_ts = u64::from_le_bytes(buf[offset..offset + 8].try_into().unwrap());
         offset += 8;
 
         // size_bytes
         if buf.len() < offset + 8 {
             return Err("buffer too small for size_bytes".into());
         }
-        let size_bytes = u64::from_le_bytes(
-            buf[offset..offset + 8].try_into().unwrap(),
-        );
+        let size_bytes = u64::from_le_bytes(buf[offset..offset + 8].try_into().unwrap());
         offset += 8;
 
         // block_size
         if buf.len() < offset + 4 {
             return Err("buffer too small for block_size".into());
         }
-        let block_size = u32::from_le_bytes(
-            buf[offset..offset + 4].try_into().unwrap(),
-        );
+        let block_size = u32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap());
         offset += 4;
 
         // headers count
         if buf.len() < offset + 2 {
             return Err("buffer too small for headers count".into());
         }
-        let headers_count = u16::from_le_bytes(
-            buf[offset..offset + 2].try_into().unwrap(),
-        ) as usize;
+        let headers_count =
+            u16::from_le_bytes(buf[offset..offset + 2].try_into().unwrap()) as usize;
         offset += 2;
 
         // headers
@@ -100,33 +116,28 @@ impl ObjectMeta {
             if buf.len() < offset + 2 {
                 break; // stop before coverage_map
             }
-            let name_len = u16::from_le_bytes(
-                buf[offset..offset + 2].try_into().unwrap(),
-            ) as usize;
+            let name_len = u16::from_le_bytes(buf[offset..offset + 2].try_into().unwrap()) as usize;
             offset += 2;
 
             if buf.len() < offset + name_len {
                 break;
             }
-            let name =
-                String::from_utf8(buf[offset..offset + name_len].to_vec())
-                    .map_err(|_| "invalid utf8 in header name")?;
+            let name = String::from_utf8(buf[offset..offset + name_len].to_vec())
+                .map_err(|_| "invalid utf8 in header name")?;
             offset += name_len;
 
             if buf.len() < offset + 2 {
                 return Err("buffer ended unexpectedly in header value length".into());
             }
-            let value_len = u16::from_le_bytes(
-                buf[offset..offset + 2].try_into().unwrap(),
-            ) as usize;
+            let value_len =
+                u16::from_le_bytes(buf[offset..offset + 2].try_into().unwrap()) as usize;
             offset += 2;
 
             if buf.len() < offset + value_len {
                 return Err("buffer ended unexpectedly in header value".into());
             }
-            let value =
-                String::from_utf8(buf[offset..offset + value_len].to_vec())
-                    .map_err(|_| "invalid utf8 in header value")?;
+            let value = String::from_utf8(buf[offset..offset + value_len].to_vec())
+                .map_err(|_| "invalid utf8 in header value")?;
             offset += value_len;
 
             headers.push((name, value));
@@ -143,7 +154,9 @@ impl ObjectMeta {
         ))
     }
 
-    pub fn deserialize_preamble(buf: &[u8]) -> Result<(ObjectMetaPreamble, ObjectMetaVersion, usize), String> {
+    pub fn deserialize_preamble(
+        buf: &[u8],
+    ) -> Result<(ObjectMetaPreamble, ObjectMetaVersion, usize), String> {
         let mut offset = 0;
 
         // Version
@@ -172,7 +185,8 @@ impl ObjectMeta {
         const BLOCK_SIZE_LEN: usize = size_of::<u32>();
         const HEADERS_COUNT_LEN: usize = size_of::<u16>();
 
-        let mut serial_len = VER_LEN + EXP_TS_LEN + SIZE_BYTES_LEN + BLOCK_SIZE_LEN + HEADERS_COUNT_LEN;
+        let mut serial_len =
+            VER_LEN + EXP_TS_LEN + SIZE_BYTES_LEN + BLOCK_SIZE_LEN + HEADERS_COUNT_LEN;
 
         const STR_PREFIX_LEN: usize = size_of::<u16>();
 
@@ -246,9 +260,11 @@ impl OpenObjectMeta {
         })
     }
 
-    async fn mark_block_covered(self, block_num: u64) -> Result<(), std::io::Error> {
+    async fn mark_block_covered(mut self, block_num: u64) -> Result<(), std::io::Error> {
         let byte_idx = self.coverage_map_offset + block_num;
-        self.file.write_at(&[1], byte_idx).await.0.map(|_| ())
+        self.file.write_at(&[1], byte_idx).await.0.map(|_| ())?;
+        self.meta.coverage_map.mark_covered(block_num as u64);
+        Ok(())
     }
 
     async fn close(self) -> Result<(), std::io::Error> {
@@ -258,7 +274,10 @@ impl OpenObjectMeta {
 
 /// Creates and opens a block file for writing.
 /// The file will be atomically created. An error will be returned if the file already exists.
-async fn create_and_open_block_file(hash: FileBlockHash, cache_root: &Path) -> Result<monoio::fs::File, std::io::Error> {
+async fn create_and_open_block_file(
+    hash: FileBlockHash,
+    cache_root: &Path,
+) -> Result<monoio::fs::File, std::io::Error> {
     let seg1 = hash.get(..2).expect("BUG: hash is too short");
     let seg2 = hash.get(2..4).expect("BUG: hash is too short");
     let filename = hash.get(4..6).expect("BUG: hash is too short");
@@ -279,4 +298,170 @@ async fn create_and_open_block_file(hash: FileBlockHash, cache_root: &Path) -> R
         .await?;
 
     Ok(file)
+}
+
+/// The kind of file read step.
+enum FileReadPlanStepKind {
+    /// Read cached blocks.
+    /// The starting and ending block numbers are to be read from.
+    CACHE,
+
+    /// Read from origin.
+    ORIGIN {
+        /// The starting byte to read from the origin (inclusive).
+        byte_start: u64,
+
+        /// The ending byte to read from the origin (inclusive).
+        byte_end: u64,
+    },
+}
+
+/// A file read plan step.
+/// Steps instruct the caller on how to read data from the file.
+/// For example, a step may be a cache read, then the next step might be an origin read.
+struct FileReadPlanStep {
+    /// The step kind.
+    pub kind: FileReadPlanStepKind,
+
+    /// The relevant starting block number (inclusive).
+    pub block_start_num: u64,
+
+    /// The relevant ending block number (inclusive).
+    pub block_end_num: u64,
+
+    /// The offset within the returned data to start returning data to the client.
+    /// This only applies to the response to return to the client, not the origin request or cache block writes.
+    client_start_offset: u64,
+
+    /// The offset within the returned data to stop returning data to the client.
+    /// This only applies to the response to return to the client, not the origin request or cache block writes.
+    client_end_offset: u64,
+}
+
+/// The struct that manages the read plan for a file.
+/// Each iteration instructs the caller on what type of read to make.
+/// For example, if it can read from the cache for the first 10 blocks, then the first iteration will return a step that reads 10 blocks,
+/// then if the next 5 blocks need to be read from origin, the second iteration will return a step that reads 5 blocks from origin.
+struct FileReadPlan {
+    start_byte: u64,
+    end_byte: u64,
+    file_size: u64,
+    block_size: u64,
+    coverage_map: LoadedCoverageMap,
+
+    cur_byte: u64,
+}
+
+impl FileReadPlan {
+    /// Creates a new FileReadPlan for the specified range and parameters.
+    pub fn new(
+        start_byte: u64,
+        end_byte: u64,
+        file_size: u64,
+        block_size: u64,
+        coverage_map: LoadedCoverageMap,
+    ) -> Self {
+        Self {
+            start_byte,
+            end_byte,
+            file_size,
+            block_size,
+            coverage_map,
+            cur_byte: start_byte,
+        }
+    }
+}
+
+impl Iterator for FileReadPlan {
+    type Item = FileReadPlanStep;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.cur_byte >= self.file_size - 1 {
+            return None;
+        }
+
+        let start_block = self.cur_byte / self.block_size;
+        let max_block = max(
+            self.end_byte / self.block_size,
+            (self.coverage_map.0.len() - 1) as u64,
+        );
+
+        // Bytes pulled from disk and origin operate on fixed-sized blocks.
+        // However, client requests may not align with block boundaries.
+        // These values store the offsets to send to the client based on the original range request.
+        let client_start_offset: u64;
+        let client_end_offset: u64;
+        if self.cur_byte == self.start_byte {
+            client_start_offset = self.start_byte % self.block_size;
+        } else {
+            client_start_offset = 0;
+        }
+        if self.end_byte - self.cur_byte < self.block_size {
+            client_end_offset = self.end_byte % self.block_size;
+        } else {
+            client_end_offset = self.block_size - 1;
+        }
+
+        let res: FileReadPlanStep;
+        let first_block_covered = self.coverage_map.0[start_block as usize];
+
+        if first_block_covered {
+            // Figure out how many cached blocks we can read consecutively.
+
+            let mut last_covered = start_block;
+            while last_covered <= max_block {
+                let is_covered = self.coverage_map.0[last_covered as usize];
+                if !is_covered {
+                    break;
+                }
+
+                last_covered += 1;
+            }
+
+            res = FileReadPlanStep {
+                kind: FileReadPlanStepKind::CACHE,
+                block_start_num: start_block,
+                block_end_num: last_covered,
+                client_start_offset: client_start_offset,
+                client_end_offset: client_end_offset,
+            };
+        } else {
+            // Figure out how many blocks we need to fetch from origin.
+
+            let mut last_uncovered = start_block;
+            let mut skipped: u64 = 0;
+            while last_uncovered <= max_block {
+                let is_covered = self.coverage_map.0[last_uncovered as usize];
+                if is_covered {
+                    skipped += 1;
+
+                    if skipped * self.block_size > MAX_COVERAGE_BLOCK_SKIP_SIZE {
+                        // Break if it's over the acceptable coverage skip size.
+                        last_uncovered -= skipped;
+                        break;
+                    }
+
+                    last_uncovered += 1;
+                } else {
+                    skipped = 0;
+                    last_uncovered += 1;
+                }
+            }
+
+            res = FileReadPlanStep {
+                kind: FileReadPlanStepKind::ORIGIN {
+                    byte_start: start_block * self.block_size,
+                    byte_end: max(last_uncovered * self.block_size, self.file_size),
+                },
+                block_start_num: start_block,
+                block_end_num: last_uncovered,
+                client_start_offset: client_start_offset,
+                client_end_offset: client_end_offset,
+            };
+        }
+
+        self.cur_byte = res.block_end_num * self.block_size;
+
+        Some(res)
+    }
 }

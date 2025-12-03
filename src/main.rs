@@ -1,21 +1,23 @@
 mod cachestate;
+mod constant;
 mod hash;
 mod origin;
+mod proxy;
 
-use std::cell::RefCell;
-use std::io;
-use std::mem::size_of_val;
-use std::os::fd::AsRawFd;
-use std::rc::Rc;
 use bytes::Bytes;
-use http::{response::Builder, StatusCode};
 use http::uri::Scheme;
-use monoio::{io::{
-    sink::{Sink, SinkExt},
-    stream::Stream,
-    Splitable,
-}, net::{TcpListener, TcpStream}, IoUringDriver};
+use http::{response::Builder, StatusCode};
 use monoio::utils::bind_to_cpu_set;
+use monoio::{
+    io::{
+        sink::{Sink, SinkExt},
+        stream::Stream,
+        Splitable,
+    },
+    net::{TcpListener, TcpStream},
+    IoUringDriver,
+};
+use monoio_http::common::body::{Body, HttpBody};
 use monoio_http::{
     common::{error::HttpError, request::Request, response::Response},
     h1::{
@@ -24,21 +26,31 @@ use monoio_http::{
     },
     util::spsc::{spsc_pair, SPSCReceiver},
 };
-use monoio_http::common::body::{Body, HttpBody};
 use monoio_http_client::Client;
+use std::cell::RefCell;
+use std::io;
+use std::mem::size_of_val;
+use std::os::fd::AsRawFd;
+use std::rc::Rc;
+
+use crate::constant::NOT_FOUND_HTML;
 
 async fn thread_main() -> Result<(), io::Error> {
     let http_client = Rc::new(Client::default());
-    let mut origin_manager = Rc::new(RefCell::new(origin::OriginManager::new()));
+    let origin_manager = Rc::new(RefCell::new(origin::OriginManager::new()));
 
     origin_manager.borrow_mut().set_origin_host(
         "stavka.localhost".to_owned(),
         Scheme::HTTPS,
-        "1.1.1.1".to_owned().try_into().expect("should have been valid authority"),
+        "1.1.1.1"
+            .to_owned()
+            .try_into()
+            .expect("should have been valid authority"),
     );
 
     let bind_addr = "0.0.0.0:50002";
-    let listener = TcpListener::bind(bind_addr).expect(&*("failed to listen on port addr ".to_owned() + bind_addr));
+    let listener = TcpListener::bind(bind_addr)
+        .expect(&*("failed to listen on port addr ".to_owned() + bind_addr));
 
     unsafe {
         let optval: libc::c_int = 1;
@@ -70,7 +82,7 @@ async fn thread_main() -> Result<(), io::Error> {
                 println!("accepted connection failed: {}", e);
             }
         }
-    };
+    }
 }
 
 fn thread_launcher(core: usize) -> std::thread::JoinHandle<()> {
@@ -81,7 +93,8 @@ fn thread_launcher(core: usize) -> std::thread::JoinHandle<()> {
             .enable_timer()
             .build()
             .expect("failed to build runtime")
-            .block_on(thread_main()).expect("failed to execute runtime function");
+            .block_on(thread_main())
+            .expect("failed to execute runtime function");
     })
 }
 
@@ -99,12 +112,7 @@ async fn handle_connection(
     let sender = GenericEncoder::new(w);
     let mut receiver = RequestDecoder::new(r);
     let (mut tx, rx) = spsc_pair();
-    monoio::spawn(handle_task(
-        rx,
-        sender,
-        http_client,
-        origin_manager,
-    ));
+    monoio::spawn(handle_task(rx, sender, http_client, origin_manager));
 
     loop {
         match receiver.next().await {
@@ -142,11 +150,7 @@ async fn handle_task(
                 return Ok(());
             }
         };
-        let resp = handle_request(
-            request,
-            http_client.clone(),
-            origin_manager.clone(),
-        ).await?;
+        let resp = handle_request(request, http_client.clone(), origin_manager.clone()).await?;
         sender.send_and_flush(resp).await.map_err(|e| e.into())?;
     }
 }
@@ -159,22 +163,21 @@ async fn handle_request(
     let uri = req.uri();
 
     fn not_found() -> Response<HttpBody> {
-        Builder::new().
-            status(StatusCode::NOT_FOUND).
-            body(
-                HttpBody::from(
-                    Payload::Fixed(FixedPayload::new(Bytes::from_static(b"hello world"))),
-                ),
-            ).unwrap()
+        Builder::new()
+            .status(StatusCode::NOT_FOUND)
+            .body(HttpBody::from(Payload::Fixed(FixedPayload::new(
+                Bytes::from_static(NOT_FOUND_HTML),
+            ))))
+            .unwrap()
     }
 
     let host = req.headers().get(http::header::HOST);
     if host == None {
-        return Ok(not_found())
+        return Ok(not_found());
     }
     let host = host.unwrap().to_str();
     if host.is_err() {
-        return Ok(not_found())
+        return Ok(not_found());
     }
     let mut host = host.unwrap();
     let colon_idx = host.rfind(':');
@@ -188,14 +191,12 @@ async fn handle_request(
     let origin_manager = origin_manager.borrow();
     let origin = origin_manager.uri_to_origin_uri(uri.clone(), host);
     if origin.is_none() {
-        return Ok(not_found())
+        return Ok(not_found());
     }
     let origin = origin.unwrap();
 
     // Make origin HTTP request.
-    let mut origin_req = Request::builder().
-        method(req.method()).
-        uri(origin);
+    let mut origin_req = Request::builder().method(req.method()).uri(origin);
 
     for (k, v) in req.headers() {
         origin_req = origin_req.header(k, v);
@@ -205,8 +206,7 @@ async fn handle_request(
     let origin_req = origin_req.body(body)?;
     let origin_res = http_client.send_request(origin_req).await?;
 
-    let mut res = Builder::new().
-        status(origin_res.status());
+    let mut res = Builder::new().status(origin_res.status());
     for (k, v) in origin_res.headers() {
         res = res.header(k, v);
     }
