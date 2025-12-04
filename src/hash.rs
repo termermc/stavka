@@ -1,4 +1,11 @@
-use std::hash::{Hasher};
+use std::hash::Hasher;
+
+// TODO NUKE EVERYTHING BELOW!
+//
+// The xxhash part is useful, though.
+// Basically, turn URLs into hashes, which will be used as part of on-disk filenames.
+// So, http://stavka.localhost/freemoney.mp4 would become xyz.
+// From there, you can check, for example, /cache/meta.xyz (meta file) and /cache/fb.xyz.1 (block one).
 
 /// Information about a file block.
 pub struct FileBlockInfo {

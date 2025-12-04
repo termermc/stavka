@@ -2,7 +2,7 @@ use crate::cachestate::ObjectMetaVersion::V0;
 use crate::constant::MAX_COVERAGE_BLOCK_SKIP_SIZE;
 use crate::hash::FileBlockHash;
 use monoio::buf::IoBufMut;
-use std::cmp::max;
+use std::cmp::{max, min};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
 use std::path::Path;
 
@@ -363,7 +363,7 @@ impl FileReadPlan {
     ) -> Self {
         Self {
             start_byte,
-            end_byte,
+            end_byte: min(end_byte, file_size),
             file_size,
             block_size,
             coverage_map,
@@ -376,7 +376,7 @@ impl Iterator for FileReadPlan {
     type Item = FileReadPlanStep;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.cur_byte >= self.file_size - 1 {
+        if self.cur_byte >= self.end_byte - 1 {
             return None;
         }
 
